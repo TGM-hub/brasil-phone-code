@@ -40,10 +40,11 @@ body{background:var(--ink);color:var(--text);font-family:'IBM Plex Sans',system-
 #ask{color:var(--muted);font-size:13px;margin-top:6px}
 
 /* ---- map ---- */
-#maparea{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;padding:0 9px 9px;gap:8px}
-#mapsvg{flex:1 1 auto;min-height:180px;width:100%;background:var(--sea);
-  border:1px solid var(--ink-3);border-radius:var(--r);touch-action:none;
-  cursor:crosshair;display:block}
+#maparea{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;
+  justify-content:flex-start;padding:0 9px 9px;gap:8px}
+#mapsvg{flex:0 1 auto;width:min(100%,64vh);aspect-ratio:1/1;margin:0 auto;
+  background:var(--sea);border:1px solid var(--ink-3);border-radius:var(--r);
+  touch-action:none;cursor:crosshair;display:block}
 #mapsvg .st{fill:var(--land);stroke:var(--brd);stroke-width:.7;vector-effect:non-scaling-stroke}
 #mapsvg .st.zone{fill:rgba(224,166,60,.30)}
 #mapsvg .st.right{fill:rgba(46,125,91,.55)}
@@ -150,9 +151,9 @@ legend{font-size:13px;font-weight:600;margin-bottom:7px}
   <div class="ov-body">
     <fieldset><legend>Niveau</legend>
       <div class="chips" id="lvl-chips">
-        <button class="chip" data-lvl="macro">Macro-zone (1er chiffre)</button>
-        <button class="chip" data-lvl="auto">Progression automatique</button>
-        <button class="chip" data-lvl="exact">Code complet</button>
+        <button class="chip" data-lvl="macro">Zone seulement</button>
+        <button class="chip" data-lvl="two">Zone puis sous-zone</button>
+        <button class="chip" data-lvl="exact">Sous-zone directement</button>
       </div>
       <p style="margin-top:7px" id="lvl-note"></p>
     </fieldset>
@@ -244,13 +245,89 @@ function inZone(z, lat, lon){
 const statePath = uf => STATES[uf].r
   .map(r => "M" + r.map(p => p[0] + " " + (-p[1])).join("L") + "Z").join("");
 
+
+/* ============================================================
+   ZONE SHAPES AND VORONOI SUB-AREAS
+   There are no official DDD polygons — the areas follow groupings of
+   municipalities. But a DDD area IS roughly the catchment of its main city,
+   so the Voronoi cell around each city approximates it well. Cells are
+   clipped to the zone's states with an SVG clipPath, which avoids any
+   polygon boolean work.
+   ============================================================ */
+const UF_ZONE = {};
+Object.entries(ZONE_UF).forEach(([z,ufs]) => ufs.forEach(u => UF_ZONE[u] = +z));
+const zonePath = z => ZONE_UF[z].map(statePath).join("");
+function zoneOfPoint(lat, lon){
+  for(const uf in STATES) if(ufContains(uf, lat, lon)) return UF_ZONE[uf] || null;
+  return null;
+}
+function zoneBBox(z){
+  let x0=180,x1=-180,y0=90,y1=-90;
+  ZONE_UF[z].forEach(uf => STATES[uf].r.forEach(r => r.forEach(([lo,la])=>{
+    if(lo<x0)x0=lo; if(lo>x1)x1=lo; if(la<y0)y0=la; if(la>y1)y1=la; })));
+  return {x0,x1,y0,y1};
+}
+/* Longitude degrees shrink toward the poles, so raw lon/lat would skew the
+   cells in the south. Scaling x by cos(mean latitude) keeps the bisectors
+   close to true great-circle ones — and the hit test uses the same metric,
+   so what you click is exactly what you see. */
+const zoneK = z => {
+  const las = CODES.filter(c=>zoneOf(c)===z).map(latOf);
+  return Math.cos((las.reduce((a,b)=>a+b,0)/las.length) * Math.PI/180);
+};
+function clipHP(poly, p, q){
+  const ax = 2*(q[0]-p[0]), ay = 2*(q[1]-p[1]);
+  const c = (q[0]*q[0]+q[1]*q[1]) - (p[0]*p[0]+p[1]*p[1]);
+  const ins = pt => ax*pt[0] + ay*pt[1] <= c;
+  const out = [];
+  for(let i=0;i<poly.length;i++){
+    const A = poly[i], B = poly[(i+1)%poly.length];
+    const ai = ins(A), bi = ins(B);
+    if(ai) out.push(A);
+    if(ai !== bi){
+      const da = ax*A[0]+ay*A[1]-c, db = ax*B[0]+ay*B[1]-c;
+      const t = da/(da-db);
+      out.push([A[0]+t*(B[0]-A[0]), A[1]+t*(B[1]-A[1])]);
+    }
+  }
+  return out;
+}
+const CELLS = {};
+function cellsOf(z){
+  if(CELLS[z]) return CELLS[z];
+  const k = zoneK(z), bb = zoneBBox(z), pad = 6;
+  const list = CODES.filter(c => zoneOf(c) === z);
+  const pts = list.map(c => [lonOf(c)*k, latOf(c)]);
+  const box = [[(bb.x0-pad)*k, bb.y0-pad], [(bb.x1+pad)*k, bb.y0-pad],
+               [(bb.x1+pad)*k, bb.y1+pad], [(bb.x0-pad)*k, bb.y1+pad]];
+  const cells = list.map((c,i) => {
+    let poly = box;
+    for(let j=0;j<pts.length && poly.length;j++) if(j!==i) poly = clipHP(poly, pts[i], pts[j]);
+    return {c, d: poly.length ? "M" + poly.map(p => (p[0]/k).toFixed(2) + " " + (-p[1]).toFixed(2)).join("L") + "Z" : ""};
+  });
+  return (CELLS[z] = {k, cells});
+}
+/* same metric as the drawing, so a click always lands in the cell you see */
+function cellAt(z, lat, lon){
+  const k = zoneK(z);
+  let best = null;
+  CODES.filter(c => zoneOf(c) === z).forEach(c => {
+    const d = (lon*k - lonOf(c)*k)**2 + (lat - latOf(c))**2;
+    if(!best || d < best.d) best = {c, d};
+  });
+  return best ? best.c : null;
+}
+/* anchors that carry the whole system: knowing 11 is São Paulo and 21 is Rio
+   does most of the work */
+const ANCHORS = ["11","21","31","41","51","61","71","81","85","91","92","98"];
+
 /* ============================================================
    STATE
    ============================================================ */
 const KEY = "dddbrasil.v1";
 const DEF = { w:{}, hit:{}, tot:{}, dist:{}, zhit:{}, ztot:{},
               seen:0, right:0, streak:0, best:0,
-              lvl:"auto", zones:[], adv:"auto" };
+              lvl:"two", zones:[], adv:"auto" };
 let S = load();
 function load(){
   try{ const r = localStorage.getItem(KEY); return r ? {...DEF, ...JSON.parse(r)} : {...DEF}; }
@@ -262,14 +339,10 @@ const setW = (c,v) => { S.w[c] = Math.min(8, Math.max(0.25, v)); };
 const accOf = c => S.tot[c] ? S.hit[c]/S.tot[c] : null;
 const zoneAcc = z => S.ztot[z] ? S.zhit[z]/S.ztot[z] : null;
 
-/* A zone graduates to full codes once you can place the zone itself. */
-const ZONE_UNLOCK = 6;
-const zoneReady = z => (S.zhit[z] || 0) >= ZONE_UNLOCK;
-function levelFor(z){
-  if(S.lvl === "macro") return "macro";
-  if(S.lvl === "exact") return "exact";
-  return zoneReady(z) ? "exact" : "macro";
-}
+/* One round, two steps: the macro zone, then the sub-zone inside it. The full
+   code is on screen throughout, so step one is "1 means São Paulo" rather than
+   a reading exercise. Miss the zone and the round stops there. */
+const startPhase = () => S.lvl === "exact" ? 2 : 1;
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -289,15 +362,15 @@ function activeCodes(){
    to -33.8. The home view has to cover all of it or the whole east coast —
    Recife, Natal, Fortaleza, Salvador — falls outside the frame. */
 const AR = 1.0;
-const HOME = { x:-76, y:-7, w:43 };
+const HOME = { x:-77, y:-7.5, w:45 };
 const MV = { x:HOME.x, y:HOME.y, w:HOME.w, h:HOME.w/AR };
-let pin = null, locked = false;
+let sel = null, locked = false;
 
 const mapEl = () => document.getElementById("mapsvg");
 function clampView(){
-  MV.w = Math.min(43, Math.max(0.8, MV.w));
+  MV.w = Math.min(45, Math.max(0.8, MV.w));
   MV.h = MV.w / AR;
-  MV.x = Math.min(-33 - MV.w, Math.max(-80, MV.x));   // keep the country on screen
+  MV.x = Math.min(-31 - MV.w, Math.max(-80, MV.x));   // room for the Recife label
   MV.y = Math.min(36 - MV.h,  Math.max(-8,  MV.y));
 }
 const applyView = () => mapEl().setAttribute("viewBox", `${MV.x} ${MV.y} ${MV.w} ${MV.h}`);
@@ -322,30 +395,90 @@ function frameOn(pts, pad){
 }
 
 function draw(){
-  const el = mapEl(); if(!el) return;
-  const t = round ? round.code : null;
-  const z = t ? zoneOf(t) : null;
-  const r = (MV.w/220).toFixed(3), fs = (MV.w/34).toFixed(2);
+  const el = mapEl(); if(!el || !round) return;
+  const z = round.zone, t = round.code, macro = round.phase === 1;
+  const fs = (MV.w/38).toFixed(2), r = (MV.w/230).toFixed(3);
   let h = "";
-  for(const uf in STATES){
-    let cls = "st";
-    if(locked && round){
-      if(round.level === "macro" && ZONE_UF[z].includes(uf)) cls = "st right";
-    } else if(round && round.level === "macro" && round.showZone && ZONE_UF[z].includes(uf)) cls = "st zone";
-    h += `<path class="${cls}" d="${statePath(uf)}"/>`;
-  }
-  if(locked && round){
-    if(round.level === "exact"){
-      CODES.filter(c => zoneOf(c) === z && c !== t)
-        .forEach(c => { h += `<circle class="dot other" cx="${lonOf(c)}" cy="${-latOf(c)}" r="${r}"/>`;
-          h += `<text class="lbl mono" x="${lonOf(c)}" y="${(-latOf(c) - MV.w/48).toFixed(2)}" font-size="${(fs*0.8)}" text-anchor="middle">${c}</text>`; });
+
+  if(macro){
+    for(let k = 1; k <= 9; k++){
+      let op = 0.52, stroke = "rgba(0,0,0,.45)", sw = 0.9;
+      if(locked){
+        if(k === z){ op = 0.92; sw = 2.2; stroke = "#FFFFFF"; }
+        else if(k === sel){ op = 0.9; sw = 2.2; stroke = "var(--wrong)"; }
+        else op = 0.16;
+      } else if(k === sel){ op = 0.85; sw = 2.2; stroke = "#FFFFFF"; }
+      h += `<path d="${zonePath(k)}" fill="${ZONE_COLOR[k]}" fill-opacity="${op}"
+             stroke="${stroke}" stroke-width="${sw}" vector-effect="non-scaling-stroke"/>`;
     }
-    h += `<circle class="dot" cx="${lonOf(t)}" cy="${-latOf(t)}" r="${(r*1.5)}"/>`;
-    h += `<text class="lbl" x="${lonOf(t)}" y="${(-latOf(t) + MV.w/26).toFixed(2)}" font-size="${fs}" text-anchor="middle">${esc(cityOf(t))}</text>`;
-    if(pin) h += `<line class="link" x1="${pin.lon}" y1="${-pin.lat}" x2="${lonOf(t)}" y2="${-latOf(t)}"/>`;
+    if(locked){
+      h += `<text class="lbl" x="${zoneLabel(z)[1]}" y="${-zoneLabel(z)[0]}" font-size="${fs*1.3}"
+             text-anchor="middle" style="fill:#fff">${z}</text>`;
+      if(sel && sel !== z)
+        h += `<text class="lbl" x="${zoneLabel(sel)[1]}" y="${-zoneLabel(sel)[0]}" font-size="${fs*1.3}"
+               text-anchor="middle" style="fill:#fff">${sel}</text>`;
+    }
+    /* the anchors carry the system; names only while asking, codes on reveal */
+    const aput = [];
+    ANCHORS.slice().sort((a,b)=>latOf(b)-latOf(a)).forEach(c => {
+      const x = lonOf(c); let y = -latOf(c) - MV.w/60;
+      for(let i=0;i<aput.length;i++){
+        const q = aput[i];
+        if(Math.abs(q.y-y) < MV.w/40 && Math.abs(q.x-x) < MV.w/8){ y = q.y + MV.w/36; i = -1; }
+      }
+      aput.push({x, y});
+      h += `<circle class="dot" cx="${x}" cy="${-latOf(c)}" r="${r}"/>`;
+      h += `<text class="lbl" x="${x}" y="${y.toFixed(2)}"
+             font-size="${fs*0.85}" text-anchor="middle">${locked ? c + " " : ""}${esc(cityOf(c))}</text>`;
+    });
+  } else {
+    for(const uf in STATES)
+      h += `<path class="st" d="${statePath(uf)}" fill-opacity="${ZONE_UF[z].includes(uf) ? 1 : 0.35}"/>`;
+    const {cells} = cellsOf(z);
+    h += `<defs><clipPath id="zc">${ZONE_UF[z].map(uf=>`<path d="${statePath(uf)}"/>`).join("")}</clipPath></defs>`;
+    h += `<g clip-path="url(#zc)">`;
+    cells.forEach(({c, d}) => {
+      if(!d) return;
+      let fill = ZONE_COLOR[z], op = 0.26, stroke = "rgba(0,0,0,.5)", sw = 1;
+      if(locked){
+        if(c === t || TWINS[t] === c){ fill = "#3FBF85"; op = 0.85; sw = 2.2; stroke = "#fff"; }
+        else if(c === sel){ fill = "#E05A48"; op = 0.85; sw = 2.2; stroke = "#fff"; }
+        else op = 0.14;
+      } else if(c === sel){ op = 0.8; sw = 2.2; stroke = "#fff"; }
+      h += `<path d="${d}" fill="${fill}" fill-opacity="${op}" stroke="${stroke}"
+             stroke-width="${sw}" vector-effect="non-scaling-stroke"/>`;
+    });
+    h += `</g>`;
+    const items = cells.map(({c}) => ({x: lonOf(c), y: -latOf(c) - MV.w/60, c}))
+                       .sort((a,b) => a.y - b.y);
+    const put = [];
+    items.forEach(it => {
+      let y = it.y;
+      for(let i=0;i<put.length;i++){
+        const q = put[i];
+        if(Math.abs(q.y-y) < MV.w/34 && Math.abs(q.x-it.x) < MV.w/9){ y = q.y + MV.w/32; i = -1; }
+      }
+      put.push({x:it.x, y});
+      /* the dot marks each sub-zone's city as something to aim at; naming it
+         before the answer would hand over the round */
+      h += `<circle class="dot" cx="${it.x}" cy="${-latOf(it.c)}" r="${r}"/>`;
+      if(locked) h += `<text class="lbl" x="${it.x}" y="${y.toFixed(2)}" font-size="${fs*0.8}"
+             text-anchor="middle">${it.c} ${esc(cityOf(it.c))}</text>`;
+    });
   }
-  if(pin) h += `<circle class="pin" cx="${pin.lon}" cy="${-pin.lat}" r="${(MV.w/130).toFixed(3)}"/>`;
   el.innerHTML = h;
+}
+
+/* a readable spot to drop a zone number: the centre of its biggest state */
+const ZLBL = {};
+function zoneLabel(z){
+  if(ZLBL[z]) return ZLBL[z];
+  let best = null;
+  ZONE_UF[z].forEach(uf => {
+    const n = STATES[uf].r.reduce((a,r)=>a+r.length, 0);
+    if(!best || n > best.n) best = {n, c: STATES[uf].c};
+  });
+  return (ZLBL[z] = best.c);
 }
 
 function wire(){
@@ -355,7 +488,7 @@ function wire(){
     e.preventDefault();
     const m = toMap(e.clientX, e.clientY);
     const k = e.deltaY > 0 ? 1.18 : 1/1.18;
-    const nw = Math.min(43, Math.max(0.8, MV.w*k)), ratio = nw/MV.w;
+    const nw = Math.min(45, Math.max(0.8, MV.w*k)), ratio = nw/MV.w;
     MV.x = m.lon - (m.lon - MV.x)*ratio;
     MV.y = -m.lat - (-m.lat - MV.y)*ratio;
     MV.w = nw; clampView(); applyView(); draw();
@@ -372,7 +505,7 @@ function wire(){
     act.set(e.pointerId, {x:e.clientX, y:e.clientY});
     if(act.size === 2 && pinch){
       const [a,b] = [...act.values()], d = Math.hypot(a.x-b.x, a.y-b.y);
-      if(d > 4){ MV.w = Math.min(43, Math.max(0.8, pinch.w*(pinch.d/d)));
+      if(d > 4){ MV.w = Math.min(45, Math.max(0.8, pinch.w*(pinch.d/d)));
         clampView(); applyView(); draw(); }
       moved = 99; return;
     }
@@ -390,10 +523,23 @@ function wire(){
     if(act.size < 2) pinch = null;
     if(!act.size) last = null;
     if(single && moved < 6 && !locked && round){
-      pin = toMap(e.clientX, e.clientY);
+      const m = toMap(e.clientX, e.clientY);
+      if(round.phase === 1){
+        const z = zoneOfPoint(m.lat, m.lon)
+               || (inZone(round.zone, m.lat, m.lon) ? round.zone : null);
+        if(!z){ $("#msg").textContent = "Clique à l'intérieur du Brésil."; return; }
+        sel = z;
+        /* naming the pick let you probe until it matched the question */
+        $("#msg").textContent = "Valider pour confirmer.";
+      } else {
+        if(!inZone(round.zone, m.lat, m.lon)){
+          $("#msg").textContent = "Reste dans la zone " + round.zone + "."; return;
+        }
+        sel = cellAt(round.zone, m.lat, m.lon);
+        $("#msg").textContent = "Valider pour confirmer.";
+      }
       draw();
       $("#btn-ok").classList.add("on");
-      $("#msg").textContent = "Valider pour confirmer.";
     }
   };
   el.addEventListener("pointerup", up);
@@ -414,70 +560,70 @@ function weightedPick(list){
 
 function newRound(){
   const code = weightedPick(activeCodes());
-  const z = zoneOf(code);
-  const level = levelFor(z);
-  pin = null; locked = false;
-  round = {code, zone:z, level, showZone:false};
-
-  $("#code").innerHTML = level === "macro"
-    ? `<span class="paren">(</span>${z}<span class="x">X</span><span class="paren">)</span>`
-    : `<span class="paren">(</span>${code}<span class="paren">)</span>`;
-  $("#ask").textContent = level === "macro"
-    ? `Macro-zone ${z} — clique n'importe où dedans`
-    : "Clique sur la zone de cet indicatif";
-  $("#msg").textContent = "Clique sur la carte.";
+  sel = null; locked = false;
+  round = {code, zone:zoneOf(code), phase:startPhase()};
+  $("#code").innerHTML = `<span class="paren">(</span>${code}<span class="paren">)</span>`;
   $("#msg").className = "";
-  $("#btn-ok").classList.remove("on");
   $("#btn-next").classList.remove("on");
   wire();
-  MV.x = HOME.x; MV.y = HOME.y; MV.w = HOME.w;
-  clampView(); applyView(); draw();
+  paintPhase();
 }
 
-function answer(){
-  if(!round || locked || !pin) return;
+function paintPhase(){
+  const z = round.zone;
+  $("#ask").textContent = round.phase === 1
+    ? "Choisis la macro-zone" : `Zone ${z} — choisis la sous-zone`;
+  $("#msg").textContent = round.phase === 1
+    ? "Clique sur une des neuf zones." : "Clique sur une sous-zone.";
+  $("#btn-ok").classList.remove("on");
+  if(round.phase === 1){ MV.x = HOME.x; MV.y = HOME.y; MV.w = HOME.w; clampView(); applyView(); }
+  else { const bb = zoneBBox(z); frameOn([[bb.y0, bb.x0], [bb.y1, bb.x1]], 1.25); }
+  draw();
+}
+
+function finish(ok, detail){
   locked = true;
-  const t = round.code, z = round.zone;
-  let ok, detail;
-
-  if(round.level === "macro"){
-    ok = inZone(z, pin.lat, pin.lon);
-    S.ztot[z] = (S.ztot[z]||0) + 1;
-    if(ok) S.zhit[z] = (S.zhit[z]||0) + 1;
-    const near = nearestCode(pin.lat, pin.lon);
-    detail = ok
-      ? `Zone ${z} — ${ZONE_NAME[z]}`
-      : `Raté. Tu as cliqué vers <b>${esc(cityOf(near.c))}</b> (${near.c}), zone ${zoneOf(near.c)}. La ${z} c'est ${esc(ZONE_NAME[z])}.`;
-  } else {
-    const near = nearestCode(pin.lat, pin.lon);
-    ok = near.c === t || TWINS[t] === near.c;
-    const km = Math.round(haversine(pin.lat, pin.lon, latOf(t), lonOf(t)));
-    S.tot[t] = (S.tot[t]||0) + 1;
-    if(ok) S.hit[t] = (S.hit[t]||0) + 1;
-    S.dist[t] = (S.dist[t]||[]).concat(km).slice(-20);
-    detail = ok
-      ? `<b>${esc(cityOf(t))}</b> — ${ufOf(t)}, à ${km} km de ton clic.`
-      : `Le plus proche de ton clic était <b>${near.c} ${esc(cityOf(near.c))}</b>. Le ${t} c'est <b>${esc(cityOf(t))}</b> (${ufOf(t)}), ${km} km plus loin.`;
-  }
-
   S.seen++;
   if(ok){ S.right++; S.streak++; S.best = Math.max(S.best, S.streak); } else S.streak = 0;
-  setW(t, ok ? wOf(t)*0.86 : wOf(t)*1.65);
+  setW(round.code, ok ? wOf(round.code)*0.86 : wOf(round.code)*1.65);
   save();
-
   $("#msg").innerHTML = detail;
   $("#msg").className = ok ? "good" : "bad";
   $("#btn-ok").classList.remove("on");
-
-  const pts = round.level === "macro"
-    ? [[pin.lat, pin.lon]].concat(CODES.filter(c=>zoneOf(c)===z).map(c=>[latOf(c), lonOf(c)]))
-    : [[pin.lat, pin.lon], [latOf(t), lonOf(t)]].concat(
-        CODES.filter(c=>zoneOf(c)===z).map(c=>[latOf(c), lonOf(c)]));
-  frameOn(pts, 1.5);
   draw();
   paintRail();
   if(S.adv === "manual") $("#btn-next").classList.add("on");
-  else setTimeout(newRound, ok ? 1700 : 3400);
+  else setTimeout(newRound, ok ? 1700 : 3600);
+}
+
+function answer(){
+  if(!round || locked || !sel) return;
+  const t = round.code, z = round.zone;
+
+  if(round.phase === 1){
+    const ok = sel === z;
+    S.ztot[z] = (S.ztot[z]||0) + 1;
+    if(ok) S.zhit[z] = (S.zhit[z]||0) + 1;
+    if(!ok){
+      finish(false, `Tu as pris la <b>${sel}</b> (${esc(ZONE_NAME[sel].split(" (")[0])}). Le ${t} c'est la <b>${z}</b> — ${esc(ZONE_NAME[z])}, à <b>${esc(cityOf(t))}</b>.`);
+      return;
+    }
+    if(S.lvl === "macro"){ finish(true, `Zone <b>${z}</b> — ${esc(ZONE_NAME[z])}`); return; }
+    round.phase = 2; sel = null;
+    paintPhase();
+    $("#msg").innerHTML = `Zone <b>${z}</b> ✓ — maintenant la sous-zone.`;
+    $("#msg").className = "good";
+    return;
+  }
+
+  const ok = sel === t || TWINS[t] === sel;
+  const km = Math.round(haversine(latOf(sel), lonOf(sel), latOf(t), lonOf(t)));
+  S.tot[t] = (S.tot[t]||0) + 1;
+  if(ok) S.hit[t] = (S.hit[t]||0) + 1;
+  S.dist[t] = (S.dist[t]||[]).concat(km).slice(-20);
+  finish(ok, ok
+    ? `<b>${t} — ${esc(cityOf(t))}</b>, ${ufOf(t)}`
+    : `Tu as pris <b>${sel} ${esc(cityOf(sel))}</b>. Le ${t} c'est <b>${esc(cityOf(t))}</b> (${ufOf(t)}), ${km} km plus loin.`);
 }
 
 function paintRail(){
@@ -490,7 +636,7 @@ document.addEventListener("keydown", e=>{
   if(document.querySelector(".overlay.open")){ if(e.key==="Escape") closeAll(); return; }
   if(e.key===" "||e.key==="Enter"){
     e.preventDefault();
-    if(!locked && pin) answer();
+    if(!locked && sel) answer();
     else if(locked) newRound();
   }
 });
@@ -507,10 +653,9 @@ function paintSettings(){
   document.querySelectorAll("#lvl-chips .chip").forEach(c=>c.setAttribute("aria-pressed", c.dataset.lvl===S.lvl));
   document.querySelectorAll("#adv-chips .chip").forEach(c=>c.setAttribute("aria-pressed", c.dataset.adv===S.adv));
   document.querySelectorAll("#zone-chips .chip").forEach(c=>c.setAttribute("aria-pressed", S.zones.includes(c.dataset.zone)));
-  const ready = Object.keys(ZONE_NAME).filter(z=>zoneReady(+z));
-  $("#lvl-note").textContent = S.lvl === "auto"
-    ? `Une zone passe au code complet après ${ZONE_UNLOCK} placements corrects de la macro-zone. Débloquées : ${ready.length ? ready.join(", ") : "aucune pour l'instant"}.`
-    : S.lvl === "macro" ? "Seulement le premier chiffre." : "Code complet dès le départ, même sur les zones non maîtrisées.";
+  $("#lvl-note").textContent = S.lvl === "two"
+    ? "Deux temps : la macro-zone, puis la sous-zone si la zone est juste. Une zone manquée arrête la manche."
+    : S.lvl === "macro" ? "Seulement la macro-zone." : "La zone est donnée, tu ne choisis que la sous-zone.";
 }
 const zBox = $("#zone-chips");
 Object.keys(ZONE_NAME).forEach(z=>{
@@ -557,7 +702,7 @@ function paintStudy(){
     s += `<text class="lbl" x="${x}" y="${y.toFixed(2)}" font-size="${FS}" text-anchor="middle">${c}</text>`;
   });
   const sv = $("#studysvg");
-  sv.setAttribute("viewBox", "-76 -7 43 43");
+  sv.setAttribute("viewBox", "-77 -7.5 45 45");
   sv.innerHTML = s;
   $("#studylist").innerHTML = Object.keys(ZONE_NAME).map(z=>{
     const rows = CODES.filter(c=>zoneOf(c)===+z).sort();
@@ -573,7 +718,7 @@ const median = a => { if(!a.length) return null; const s=[...a].sort((x,y)=>x-y)
   return s.length%2 ? s[m] : Math.round((s[m-1]+s[m])/2); };
 function paintStats(){
   const zrows = Object.keys(ZONE_NAME).filter(z=>S.ztot[z]).map(z=>({
-    z, acc:zoneAcc(z), tot:S.ztot[z], ready:zoneReady(+z) }));
+    z, acc:zoneAcc(z), tot:S.ztot[z] }));
   const crows = CODES.filter(c=>S.tot[c]).map(c=>({
     c, acc:accOf(c), tot:S.tot[c], md:median(S.dist[c]||[]) })).sort((a,b)=>a.acc-b.acc);
   if(!zrows.length && !crows.length){
@@ -583,7 +728,7 @@ function paintStats(){
   if(zrows.length){
     h += `<h3 style="font-size:14px;margin-bottom:6px">Macro-zones</h3>
       <table class="tbl"><tr><th>Zone</th><th></th><th class="km">réussite</th><th class="km">essais</th></tr>` +
-      zrows.map(r=>`<tr><td class="c">${r.z}</td><td>${esc(ZONE_NAME[r.z].split(" (")[0])}${r.ready?' <span style="color:var(--right);font-size:11px">débloquée</span>':""}</td>
+      zrows.map(r=>`<tr><td class="c">${r.z}</td><td>${esc(ZONE_NAME[r.z].split(" (")[0])}</td>
         <td class="km">${Math.round(100*r.acc)}%</td><td class="km">${r.tot}</td></tr>`).join("") + `</table>`;
   }
   if(crows.length){
